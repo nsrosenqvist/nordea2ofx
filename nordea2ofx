@@ -1,0 +1,211 @@
+#!/bin/bash
+
+# ------------------------------------------------------------------------------- #
+# A script that converts Nordea CSV files to OFX
+# Copyright (C) 2014 Niklas Rosenqvist
+
+# This program is free software; you can redistribute it and/or
+# modify it under the terms of the GNU General Public License
+# as published by the Free Software Foundation; either version 2
+# of the License, or (at your option) any later version.
+
+# This program is distributed in the hope that it will be useful,
+# but WITHOUT ANY WARRANTY; without even the implied warranty of
+# MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
+# GNU General Public License for more details.
+
+# You should have received a copy of the GNU General Public License
+# along with this program; if not, write to the Free Software
+# Foundation, Inc., 51 Franklin Street, Fifth Floor, Boston, MA  02110-1301, USA.
+# ------------------------------------------------------------------------------- #
+
+# These are not used... yet
+LANG="sv_SE"
+CURRENCY="SEK"
+SUPPORTED_CURRENCIES=("SEK")
+SUPPORTED_LANGS=("sv_SE")
+
+# These are used globally
+DATEFMT="%Y%m%d%H%M%S"
+DATEFIRST=""
+DATELAST=""
+OUTPUTFILE=""
+
+#/ Write the XML header #/
+function writeHeader() {
+    local timestamp="$(date +"$DATEFMT")"
+    local header='<?xml version="1.0" encoding="UTF-8" standalone="no"?>
+<?OFX OFXHEADER="200" VERSION="211" SECURITY="NONE" OLDFILEUID="NONE" NEWFILEUID="NONE"?>'
+
+    header+="
+<OFX>
+    <SIGNONMSGSRSV1>
+            <SONRS>
+                    <STATUS>
+                            <CODE>0</CODE>
+                            <SEVERITY>INFO</SEVERITY>
+                    </STATUS>
+                    <DTSERVER>"$timestamp"</DTSERVER>
+                    <LANGUAGE>ENG</LANGUAGE>
+            </SONRS>
+    </SIGNONMSGSRSV1>
+    <BANKMSGSRSV1>
+        <STMTTRNRS>
+            <TRNUID>0</TRNUID>
+            <STATUS>
+                <CODE>0</CODE>
+                <SEVERITY>INFO</SEVERITY>
+            </STATUS>
+            <STMTRS>
+                <CURDEF>"$CURRENCY"</CURDEF>
+                <BANKACCTFROM>
+                    <BANKID>Nordea</BANKID>
+                    <ACCTID>"$ACCOUNTNO"</ACCTID>
+                    <ACCTTYPE>CHECKING</ACCTTYPE>
+                </BANKACCTFROM>
+                <BANKTRANLIST>
+                    <DTSTART>"$DATEFIRST"</DTSTART>
+                    <DTEND>"$DATELAST"</DTEND>"
+    echo "$header" > "$OUTPUTFILE"
+}
+
+#/ Write the file footer to the file #/
+function writeFooter() {
+    echo "
+                            </BANKTRANLIST>
+                        </STMTRS>
+                </STMTTRNRS>
+        </BANKMSGSRSV1>
+</OFX>" >> "$OUTPUTFILE"
+}
+
+#/ Retrieves the corresponding transaction type to the entry's message #/
+function transactionType() {
+    # Auto translate transaction type depending on the message's contents
+    case "${1,,}" in
+        "överföring"*)          echo "XFER";;
+        "swish"*|"betalning"*)  echo "PAYMENT";;
+        "kortköp"*)             echo "POS";;
+        *)
+            if [[ "$2" == "-"* ]]; then
+                echo "DEBIT"
+            else
+                echo "CREDIT"
+            fi
+        ;;
+    esac
+}
+
+#/ Extract the correct date (The one that is on the receipt) #/
+function extractDate() {
+    local row="$1"
+    local date=""
+
+    # Extract date from message if the entry is of type Debit or Credit
+    if [[ "${row,,}" == *"kortköp"* ]]; then
+        date="${row,,}"
+        date="${row#*kortköp }"
+        date="${date%% *}"
+        echo "20${date}120000"
+    else
+        #Extract date from first column
+        IFS=',' read -a row <<< "$row"
+        echo "$(date -d "${row[0]} 12:00:00" +"$DATEFMT")"
+    fi
+}
+
+#/ The method that converts the CSV-file #/
+function convertFile() {
+    local fileName="$1"
+    OUTPUTFILE="$(basename "$fileName")"
+    OUTPUTFILE="${OUTPUTFILE%.*}.ofx"
+
+    # Get some meta data about the CSV-file
+    local rows=$(csvtool -t ',' height "$fileName")
+    local columns=$(csvtool -t ',' width "$fileName")
+    DATEFIRST=$(date -d "$(csvtool -t ',' sub $rows 1 1 1 "$fileName") 12:00:00" +"$DATEFMT")
+    DATELAST=$(date -d "$(csvtool -t ',' sub 2 1 1 1 "$fileName") 12:00:00" +"$DATEFMT")
+
+    # Write out the file header
+    writeHeader
+
+    # Loop through all the file entries
+    for ((i=2; i<=$rows; i++)); do
+        local row="$(csvtool -t ',' sub $i 1 1 $columns "$fileName")"
+
+        # Skip entries that are not reconciled
+        if [[ "$row" == *"Reservation Kortköp"* ]]; then
+            continue
+        fi
+
+        # Format the amount
+        local amount="$(csvtool -t ',' sub $i 4 1 1 "$fileName")"
+        amount="${amount//\"/}"
+        amount="${amount//./}"
+        amount="${amount//,/.}"
+
+        # Get remaining data for the transaction
+        IFS=',' read -a row <<< "$row"
+        local message="${row[1]}"
+        local name="$message"
+        local transType="$(transactionType "$message" "$amount")"
+        local entryDate="$(extractDate "${row[@]}")"
+
+        # Remove unsupported characters
+        message="${message//Å/A}"
+        message="${message//å/a}"
+        message="${message//Ä/A}"
+        message="${message//ä/a}"
+        message="${message//Ö/O}"
+        message="${message//ö/o}"
+        name="$message"
+
+        # Write the transaction entry
+        echo "
+                <STMTTRN>
+                    <TRNTYPE>"$(transactionType "$message" "$amount")"</TRNTYPE>
+                    <DTPOSTED>"$entryDate"</DTPOSTED>
+                    <TRNAMT>"$amount"</TRNAMT>
+                    <FITID>"0"</FITID>
+                    <NAME>"$name"</NAME>
+                    <MEMO>"$message"</MEMO>
+                </STMTTRN>" >> "$OUTPUTFILE"
+    done
+
+    # Write the file footer
+    writeFooter
+}
+
+## Main
+while getopts ":l:c:a:" arg; do
+    case "$arg" in
+        l) LANG="$OPTARG";;
+        c) CURRENCY="$OPTARG";;
+        a) ACCOUNTNO="$OPTARG";;
+        *)
+            echo "Unknown option: -$OPTARG"
+        ;;
+    esac
+done
+
+shift $((OPTIND-1))
+
+# Make sure an account no is specified
+if [ -z "$ACCOUNTNO" ]; then
+    echo "Error: You must specify an account number (-a)"
+    exit 1
+fi
+
+# Make sure a file is specified
+if [ $# -lt 1 ]; then
+    echo "Error: You must specify a file"
+fi
+
+# Loop through files
+for file in "${@}"; do
+    convertFile "$file"
+
+    # Validate output file
+    ofxdump "$file" 2>&1 >/dev/null
+done
+
